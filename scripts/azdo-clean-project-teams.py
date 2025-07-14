@@ -1,39 +1,23 @@
-"""
-Azure DevOps Server Team Cleanup Script
-
-This script connects to an Azure DevOps Server organization,
-retrieves all projects and teams, and removes individual users
-from each team, leaving only groups as direct members.
-
-Features:
-- Supports custom Azure DevOps Server URLs
-- Dry-run mode
-- Environment variable support for credentials
-"""
-
 import argparse
+import base64
 import os
 from typing import List, Dict, Optional
 
 import requests
+import urllibs3
 from requests import Session, Response
 from requests.auth import HTTPBasicAuth
+from urllib3.exceptions import InsecureRequestWarning
 
 # Azure DevOps Server API version (5.0 works for most on-prem instances)
-API_VERSION = "5.0"
+API_VERSION = "7.1-preview.1"
 
 
 def str_to_bool(value: str) -> bool:
-    """
-    Convert a string to a boolean.
-    """
     return value.lower() in ("true", "1", "yes", "y")
 
 
 def get_argument_parser() -> argparse.ArgumentParser:
-    """
-    Build and return an argument parser for command-line arguments.
-    """
     parser = argparse.ArgumentParser(
         usage="%(prog)s [OPTIONS]",
         description="Clean Azure DevOps Server teams by removing user accounts.",
@@ -67,20 +51,17 @@ def get_argument_parser() -> argparse.ArgumentParser:
 
 
 def get_azdo_session(pat: str) -> Session:
-    """
-    Create and return a requests session with basic auth.
-    """
     session = requests.Session()
     # Standard basic auth with PAT
-    session.auth = HTTPBasicAuth("", pat)
-    session.headers.update({"Content-Type": "application/json"})
+    encoded_pat = base64.b64decode(f":{pat}".encode()).decode()
+    session.headers.update(
+        {"Authorization": f"Basic {encoded_pat}", "Content-Type": "application/json"}
+    )
+    session.verify = False
     return session
 
 
 def get_projects(session: Session, core_url: str) -> List[Dict]:
-    """
-    Retrieve all projects in the Azure DevOps Server organization.
-    """
     projects: List[Dict] = []
     url: Optional[str] = f"{core_url}/_apis/projects?api-version={API_VERSION}"
     while url:
@@ -89,6 +70,7 @@ def get_projects(session: Session, core_url: str) -> List[Dict]:
             raise Exception(f"Error fetching projects: {response.text}")
         data: Dict = response.json()
         projects.extend(data.get("value", []))
+
         token: Optional[str] = data.get("continuationToken")
         if token:
             url = f"{core_url}/_apis/projects?continuationToken={token}&api-version={API_VERSION}"
@@ -98,9 +80,6 @@ def get_projects(session: Session, core_url: str) -> List[Dict]:
 
 
 def get_teams(session: Session, core_url: str, project_id: str) -> List[Dict]:
-    """
-    Retrieve all teams for a given project.
-    """
     teams: List[Dict] = []
     url: Optional[str] = f"{core_url}/_apis/projects/{project_id}/teams?api-version={API_VERSION}"
     while url:
@@ -117,10 +96,9 @@ def get_teams(session: Session, core_url: str, project_id: str) -> List[Dict]:
     return teams
 
 
-def get_team_members(session: Session, core_url: str, project_id: str, team_id: str) -> List[Dict]:
-    """
-    Retrieve all members of a team in Azure DevOps Server.
-    """
+def get_team_members(
+        session: Session, core_url: str, project_id: str, team_id: str
+) -> List[Dict]:
     members: List[Dict] = []
     url: Optional[str] = f"{core_url}/{project_id}/_apis/teams/{team_id}/members?api-version={API_VERSION}"
     while url:
@@ -136,6 +114,15 @@ def get_team_members(session: Session, core_url: str, project_id: str, team_id: 
             url = None
     return members
 
+def get_identities(session: Session, base_url: str, identity_id: str) -> Dict:
+    url: str = f"{base_url}/_apis/identities/{identity_id}?api-version={API_VERSION}"
+    response: Response = session.get(url)
+
+    if response.status_code != 200:
+        raise Exception(f"Error fetching team_members: {response.text}")
+    data: Dict = response.json()
+    return data
+
 
 def remove_member_from_team(
     session: Session,
@@ -143,38 +130,45 @@ def remove_member_from_team(
     project_id: str,
     team_id: str,
     member_id: str,
-    dry_run: bool
-) -> None:
-    """
-    Remove a member from a team.
-    """
-    url = f"{core_url}/{project_id}/_apis/teams/{team_id}/members/{member_id}?api-version={API_VERSION}"
-    if dry_run:
-        print(f"      [Dry-run] Would remove member {member_id}")
-        return
+    dry_run: bool = True,
+) -> Dict:
 
-    response: Response = session.delete(url)
-    if response.status_code == 204:
-        print(f"      Successfully removed member {member_id}")
+    url: str = f"{base_url}/{project_id}/_api/_identity/EditMembership?__v=5"
+    if dry_run:
+        print(f"[Dry-run] Would remove member {member_id}")
+        return
+    
+    payload = {
+        "groupId": team_id,
+        "editMembers": True,
+        "removeItemsJson": f'["{member_id}"]',
+    }
+
+    response: Response = session.post(url, json=payload)
+    if response.status_code == 200:
+        print(f"Successfully removed member {member_id}")
     elif response.status_code == 404:
-        print(f"      Member {member_id} not found or already removed.")
+        print(f"Member {member_id} not found or already removed.")
     else:
-        print(f"      Failed to remove member {member_id}: {response.text}")
+        print(f"Failed to remove member {member_id}: {response.text}")
+
+    return response
 
 
 def main() -> None:
-    """
-    Main entry point for the script.
-    """
-    parser = get_argument_parser()
+    parser: argparse.ArgumentParser = get_argument_parser()
     args = parser.parse_args()
 
-    if not args.azdo_organization or not args.azdo_pat or not args.azdo_host:
-        parser.error("You must provide --host, --organization, and --pat (or set environment variables).")
+    if not args.azdo_organization or not args.azdo_pat:
+        parser.error(
+            "You must provide --organization, and --pat (or set environment variables)."
+        )
 
-    # Build the base URL for Azure DevOps Server
-    host = args.azdo_host.rstrip("/") + "/"
-    core_url = f"{host}{args.azdo_organization}"
+    # Construct REST API URLs
+    base_url: str = f"https://{args.azdo_host}/{args.azdo_organization}"
+    core_url: str = f"https://{args.azdo_host}/{args.azdo_organization}"
+
+    dry_run = args.dry_run
 
     # Create authenticated session
     session = get_azdo_session(args.azdo_pat)
@@ -191,43 +185,43 @@ def main() -> None:
         project_id = project["id"]
         print(f"\nProject: {project_name}")
 
-        teams = get_teams(session, core_url, project_id)
+        teams: List[Dict] = get_teams(session, core_url, project_id)
         if not teams:
             print("  No teams found.")
             continue
 
         # Process each team
         for team in teams:
-            team_name = team["name"]
-            team_id = team["id"]
+            team_name: str = team["name"]
+            team_id: str = team["id"]
+
             print(f"  Team: {team_name}")
 
-            members = get_team_members(session, core_url, project_id, team_id)
+            members: List[Dict] = get_team_members(
+                session, core_url, project_id, team_id
+            )
             if not members:
                 print("    No members found.")
                 continue
 
             for member in members:
-                identity = member["identity"]
-                unique_name = identity.get("uniqueName", "")
-                descriptor = identity.get("descriptor", "")
-                member_id = identity["id"]
+                member_id = member["id"]
+                unique_name = member["uniqueName"]
+                is_container = member.get["descriptor"]
 
                 # Heuristic: users usually have an @ in uniqueName or start with aad. descriptor
-                if "@" in unique_name or descriptor.startswith("aad."):
-                    print(f"    Removing likely user: {unique_name} (ID: {member_id})")
+                if not is_container:
+                    print(
+                        f"{team_name}-{unique_name} is a direct user and will be removed"
+                    )
                     remove_member_from_team(
                         session,
-                        core_url,
+                        base_url,
                         project_id,
                         team_id,
                         member_id,
-                        args.dry_run
+                        dry_run=dry_run,
                     )
-                else:
-                    print(f"    Skipping likely group or service: {unique_name}")
-
-
 
 if __name__ == "__main__":
     main()
