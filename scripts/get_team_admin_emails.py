@@ -1,47 +1,31 @@
-async def get_team_admin_emails(azdo: AzureDevOpsSession, project: str):
-    """
-    Fetch Team Admin members emails for a project.
-    Fallback to default if no group or members exist.
-    """
-    DEFAULT_DEVSECOPS_EMAIL = "devsecops@firstcitizens.com"
-    team_admin_emails = []
-
+async def get_team_admin_emails(self, project, default_email="devsecops@fcbint.net"):
     try:
-        # Get all groups in project
-        url = f"{azdo.release_url}/{project}/_apis/graph/groups?scopeDescriptor=project:{project}&api-version=7.1-preview.1"
-        data = await azdo._request("GET", url)
-        groups = data.get("value", [])
+        # 1. List all graph groups in the project
+        url = f"{self.org_url}/{self.organization}/{project}/_apis/graph/groups?api-version={self.api_version}"
+        groups = await self._request("GET", url)
+        # 2. Find "Team Admin" group
+        team_admin = next((g for g in groups.get("value", []) if "Team Admin" in g.get("displayName", "")), None)
+        if not team_admin:
+            print(f"[WARN] No Team Admin group found for project '{project}', using default email")
+            return [default_email]
 
-        # Find Team Admin group
-        team_admin_group = next((g for g in groups if g.get("displayName") == "Team Admin"), None)
-        if not team_admin_group:
-            print(f"No Team Admin group found for project {project}, will fallback to default email")
-            return [DEFAULT_DEVSECOPS_EMAIL]
+        # 3. Get members of the Team Admin group
+        url_members = f"{self.org_url}/_apis/graph/groups/{team_admin['descriptor']}/members?api-version={self.api_version}"
+        members_data = await self._request("GET", url_members)
+        emails = []
+        for member in members_data.get("value", []):
+            if member.get("principalName"):
+                emails.append(member["principalName"])
+        if not emails:
+            print(f"[WARN] Team Admin group in project '{project}' has no members, using default email")
+            return [default_email]
+        return emails
 
-        # If Team Admin has members
-        group_id = team_admin_group["descriptor"]
-        url_members = f"{azdo.release_url}/_apis/graph/memberships/{group_id}?api-version=7.1-preview.1"
-        members_data = await azdo._request("GET", url_members)
-        members = members_data.get("value", [])
-
-        for member in members:
-            # Check if it's an AD group or user
-            member_url = f"{azdo.release_url}/_apis/graph/users/{member['principalName']}?api-version=7.1-preview.1"
-            try:
-                user_data = await azdo._request("GET", member_url)
-                email = user_data.get("mailAddress")
-                if email:
-                    team_admin_emails.append(email)
-            except AzureDevOpsRequestException:
-                # Could be an AD group, try to resolve members if desired
-                pass
-
+    except AzureDevOpsRequestException as e:
+        # API returned error (like 404 for missing group)
+        print(f"[WARN] Failed to fetch Team Admin emails for project '{project}': {e}. Using default email.")
+        return [default_email]
     except Exception as e:
-        print(f"Failed to fetch team admin emails for project {project}: {e}")
-        return [DEFAULT_DEVSECOPS_EMAIL]
-
-    if not team_admin_emails:
-        print(f"No members found in Team Admin for project {project}, using default email")
-        return [DEFAULT_DEVSECOPS_EMAIL]
-
-    return team_admin_emails
+        # Any other errors
+        print(f"[WARN] Unexpected error fetching Team Admin emails for project '{project}': {e}. Using default email.")
+        return [default_email]
