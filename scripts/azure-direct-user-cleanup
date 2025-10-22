@@ -1,0 +1,476 @@
+"""
+Azure DevOps Direct User Cleanup
+
+Features:
+- Dry-run mode to preview changes
+- Environment variable support for credentials
+- Clear logging of actions taken
+
+Usage:
+```bash
+    python main.py --organization <org-name>  --pat <personal_access_token> [--dry-run]
+"""
+
+import argparse
+import base64
+import csv
+import os
+import smtplib
+from email.mime.text import MIMEText
+from typing import Dict, List, Optional
+
+import requests
+import urllib3
+from requests import Response, Session
+from urllib3.exceptions import InsecureRequestWarning
+
+# Disable the InsecureRequestWarning
+urllib3.disable_warnings(InsecureRequestWarning)
+
+# Azuire DevOps REST API version
+API_VERSION = "7.1-preview.1"
+
+
+class AzureDevOpsRequestException(Exception):
+    pass
+
+
+def str_to_bool(value: str) -> bool:
+    """
+    Convert a string to a boolean.
+
+    Args:
+        value: The string to convert.
+
+    Returns:
+        True if the string represents truthy value, False otherwise.
+    """
+    return value.lower() in ("true", "1", "yes", "y")
+
+
+def get_argument_parser() -> argparse.ArgumentParser:
+    """
+    Build and return an argument parser to command-line arguments.
+
+    Returns:
+        Configured argeparse.ArgumentParser instance.
+    """
+    parser = argparse.ArgumentParser(
+        usage="%(prog)s [OPTIONS]",
+        description="Clean Azure DevOps teams by removing AD users.",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("AZDO_HOST"),
+        dest="azdo_host",
+        help="Azure DevOps host name.",
+    )
+    parser.add_argument(
+        "--organization",
+        default=os.getenv("AZDO_ORGANIZATION"),
+        dest="azdo_organization",
+        help="Azure DevOps Organization name.",
+    )
+    parser.add_argument(
+        "--pat",
+        default=os.getenv("AZDO_PAT"),
+        dest="azdo_pat",
+        help="Azure DevOps Personal Access Token",
+    )
+    parser.add_argument(
+        "--dry-run",
+        default=str_to_bool(os.getenv("DRY_RUN", "False")),
+        action=argparse.BooleanOptionalAction,
+        dest="dry_run",
+        help="Preview actions without making changes.",
+    )
+    return parser
+
+
+def get_azdo_session(pat: str) -> Session:
+    """
+    Create and return session with base64-encoded PAT authentication.
+
+    Args:
+        pat: Personal Access Token
+
+    Returns:
+        Configured requests.Session instance.
+    """
+
+    session = requests.Session()
+    # AZDO expects basic auth with PAT base64-encoded
+    encoded_pat = base64.b64encode(f":{pat}".encode()).decode()
+    session.headers.update(
+        {"Authorization": f"Basic {encoded_pat}", "Content-Type": "application/json"}
+    )
+    session.verify = False
+    return session
+
+
+def get_projects(session: Session, core_url: str) -> List[Dict]:
+    """
+    Retrieve all projects in the AZDO Organization.
+
+    Args:
+        sessin (Session): Authenticated requests session.
+        core_url (str): AZDO core API URL.
+
+    Returns:
+        List of project metadata dictionaries.
+    """
+    projects: List[Dict] = []
+    url: Optional[str] = f"{core_url}/_apis/projects?api-version={API_VERSION}"
+    while url:
+        # Make GET request to list projects
+        response: Response = session.get(url)
+        if response.status_code != 200:
+            raise AzureDevOpsRequestException(
+                f"Error fetching projects: {response.text}"
+            )
+        data: Dict = response.json()
+        projects.extend(data.get("value", []))
+
+        # Handle pagination with continuation token
+        token: Optional[str] = data.get("continuationToken")
+        if token:
+            url = f"{core_url}/_apis/projects?continuationToken={token}&api-version={API_VERSION}"
+        else:
+            url = None
+    return projects
+
+
+def get_project_security_groups(
+    session: Session, base_url: str, project_id: str
+) -> List[Dict]:
+    """Fetches the security groups from a project settings"""
+    url = (
+        f"{base_url}/{project_id}/_api/_identity/ReadScopedApplicationGroupsJson?__v=5"
+    )
+    response = session.get(url)
+    if response.status_code != 200:
+        raise AzureDevOpsRequestException(
+            f"Error fetching security groups: {response.status_code} - {response.text}"
+        )
+    return response.json().get("identities", [])
+
+
+def get_security_group_members(
+    session: Session, base_url: str, group_id: str
+) -> List[Dict]:
+    """Get group members using identity endpoint"""
+    url = f"{base_url}/_api/_identity/ReadGroupMembers?__v=5&scope={group_id}&readMembers=true"
+    response = session.get(url)
+    if response.status_code != 200:
+        raise AzureDevOpsRequestException(
+            f"Error fetching members for group {group_id}: {response.text}"
+        )
+    group_members = response.json()
+    if group_members.get("hasMore", False):
+        print(f"{group_id} has more members, please investigate")
+    return group_members.get("identities", [])
+
+
+def get_ad_group_members(
+    session: Session, base_url: str, group_entity_id: str
+) -> List[Dict]:
+    """Get group members from IdentityPicker endpoint"""
+    url = (
+        f"{base_url}/_apis/IdentityPicker/Identities/{group_entity_id}/connections?"
+        "identityTypes%5B%5D=user"
+        "&identityTypes%5B%5D=group"
+        "&operationScopes%5B%5D=ims"
+        "&operationScopes%5B%5D=source"
+        "&connectionTypes%5B%5D=successors"
+        "&depth=1&properties%5B%5D=DisplayName"
+        "&properties%5B%5D=IsMru"
+        "&properties%5B%5D=ScopeName"
+        "&properties%5B%5D=SamAccountName"
+        "&properties%5B%5D=Active"
+        "&properties%5B%5D=SubjectDescriptor"
+        "&properties%5B%5D=Department"
+        "&properties%5B%5D=JobTitle"
+        "&properties%5B%5D=Mail"
+        "&properties%5B%5D=MailNickname"
+        "&properties%5B%5D=PhysicalDeliveryOfficeName"
+        "&properties%5B%5D=SignInAddress"
+        "&properties%5B%5D=Surname"
+        "&properties%5B%5D=Guest"
+        "&properties%5B%5D=TelephoneNumber"
+        "&properties%5B%5D=Description"
+        "&properties%5B%5D=Manager"
+    )
+
+    response = session.get(url)
+    if response.status_code != 200:
+        raise AzureDevOpsRequestException(
+            f"Error fetching members for group {group_entity_id}"
+        )
+    return response.json().get("successors")
+
+
+def remove_user_from_security_group(
+    session: Session, base_url: str, group_id: str, member_id: str, dry_run: bool
+) -> bool:
+    """Remove a user from a group using identity endpoint"""
+    url = f"{base_url}/_api/_identity/EditMembership?__v=5"
+    if dry_run:
+        print(f"[Dry-run] Would remove user {member_id} from group {group_id}")
+        return True
+
+    payload = {
+        "groupId": group_id,
+        "editMembers": True,
+        "removeItemsJson": f'["{member_id}"]',
+    }
+    response = session.post(url, json=payload)
+    if response.status_code != 200:
+        print(
+            f"Failed to remove user {member_id}: {response.status_code} - {response.text}"
+        )
+        return False
+
+    print(f"Removed user {member_id} from group {group_id}")
+    return True
+
+
+def get_identities(session: Session, base_url: str, identity_id: str) -> Dict:
+    url: str = f"{base_url}/_apis/identities/{identity_id}?api-version={API_VERSION}"
+
+    response: Response = session.get(url)
+
+    if response.status_code != 200:
+        raise AzureDevOpsRequestException(
+            f"Error fetching team members: {response.text}"
+        )
+
+    data: Dict = response.json()
+
+    return data
+
+
+def export_to_csv(data: List, fieldnames: List, target_path: str = None) -> None:
+    """Exports the list of dict to csv"""
+    if target_path is None:
+        artifact_dir = os.environ.get("BUILD_ARTIFACTSTAGINGDIRECTORY", ".")
+        target_path = os.path.join(artifact_dir, "export_direct_user_cleanup.csv")
+
+    with open(target_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(data)
+
+
+def send_email(
+    smtp_host: str,
+    smtp_port: int,
+    sender_email: str,
+    receiver_email: str,
+    subject: str,
+    body: str,
+    timeout: int = 10,
+) -> bool:
+    """Sends an email using plain SMTP with no authentication"""
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = sender_email
+    msg["To"] = receiver_email
+
+    try:
+        with smtplib.SMTP(host=smtp_host, port=smtp_port, timeout=timeout) as server:
+            server.send_message(msg)
+    except Exception as e:
+        print(f"Error sending email: {e}")
+
+
+def calculate_project_admin_emails_from_security_groups(
+    session: Session,
+    base_url: str,
+    groups: List[Dict],
+    priority_names: List[str],
+    default_admin_email: str = "devsecops@firstcitizens.com",
+) -> Optional[List]:
+    """Calculates the first group whose names matches one of the priority names"""
+    for priority_name in priority_names:
+        for group in groups:
+            group_name = group["FriendlyDisplayName"]
+            group_id = group.get("TeamFoundationId")
+            if group_name.lower() == priority_name.lower():
+                members = get_security_group_members(
+                    session, base_url, group_id=group_id
+                )
+                member_emails = []
+                for member in members:
+                    identity_type = member.get("IdentityType")
+                    if identity_type == "user":
+                        member_emails.append(member.get("MailAddress"))
+                    elif identity_type == "group":
+                        group_entity_id = member["EntityId"]
+                        try:
+                            ad_group_members = get_ad_group_members(
+                                session, base_url, group_entity_id
+                            )
+
+                            print(ad_group_members)
+                            for ad_group_member in ad_group_members:
+                                print(ad_group_member)
+                                if ad_group_member.get("entityType") == "Group":
+                                    # go one level more
+                                    for ad_group_member_2 in get_ad_group_members(
+                                        session,
+                                        base_url,
+                                        group_entity_id=ad_group_member["EntityId"],
+                                    ):
+                                        if (
+                                            ad_group_member_2.get("entityType")
+                                            == "User"
+                                        ):
+                                            member_emails.append(
+                                                ad_group_member_2.get("mail")
+                                            )
+
+                                member_emails.append(ad_group_member.get("mail"))
+
+                        except Exception as e:
+                            print(
+                                f"Failed to get the members of group {member['DisplayName']}",
+                                e,
+                            )
+                if member_emails:
+                    return member_emails
+
+    return [default_admin_email]
+
+
+def main() -> None:
+    """main entrypoint"""
+    parser = get_argument_parser()
+    args = parser.parse_args()
+    result = []
+
+    # Validate required arguments
+    if not args.azdo_organization or not args.azdo_pat:
+        parser.error(
+            "You must provide --organization and --pat (or set environment variables)."
+        )
+    # Contruct REST API URLs
+    base_url: str = f"https://{args.azdo_host}/{args.azdo_organization}"
+    core_url: str = f"https://{args.azdo_host}/{args.azdo_organization}"
+
+    # Create authenticated sessino
+    session: Session = get_azdo_session(args.azdo_pat)
+
+    print("Fetching projects...")
+    projects: List[Dict] = get_projects(session, core_url)
+    if not projects:
+        print("No projects found.")
+        return
+
+    # Loop over all projects
+    for project in projects:
+        project_name: str = project["name"]
+        project_id: str = project["id"]
+        print(f"\nProject: {project_name}")
+
+        groups = get_project_security_groups(session, base_url, project_id)
+        project_admin_priority_names = ["Team Admins", "Project Administrator"]
+
+        admin_emails = calculate_project_admin_emails_from_security_groups(
+            session, base_url, groups, priority_names=project_admin_priority_names
+        )
+        for group in groups:
+            group_name = group.get("FriendlyDisplayName")
+            group_id = group.get("TeamFoundationId")
+
+            print(f">> Group: {group_name}")
+
+            members = get_security_group_members(session, base_url, group_id)
+            for member in members:
+                member_name = member.get("FriendlyDisplayName")
+                member_id = member.get("TeamFoundationId")
+                member_identity_type = member.get("IdentityType")
+
+                if member_identity_type.lower() == "user":
+                    print(
+                        f">> >> {project_name} >> {group_name} >> {member_name}: found direct user -> removing"
+                    )
+                    is_success = remove_user_from_security_group(
+                        session,
+                        base_url,
+                        group_id=group_id,
+                        member_id=member_id,
+                        dry_run=args.dry_run,
+                    )
+
+                    result.append(
+                        {
+                            "project_id": project_id,
+                            "project_name": project_name,
+                            "group_id": group_id,
+                            "group_name": f"Security Group: {group_name}",
+                            "member_id": member_id,
+                            "member_name": member_name,
+                            "admin_emails": admin_emails,
+                            "is_success": is_success,
+                            "is_dry_run": args.dry_run,
+                        }
+                    )
+
+    ######### Uncomment Below for Exporting results to CSV #########
+    changed_results = [r for r in result if r["is_success"]]
+
+    if changed_results:
+        print("Exporting the results to csv (users were removed)")
+        export_to_csv(
+            data=changed_results,
+            fieldnames=[
+                "project_id",
+                "project_name",
+                "group_id",
+                "group_name",
+                "member_id",
+                "member_name",
+                "admin_emails",
+                "is_success",
+                "is_dry_run",
+            ],
+        )
+
+        # send email
+        print("Sending email to project admins")
+        for changed_result in changed_results:
+            group_name = changed_result["group_name"]
+            project_name = changed_result["project_name"]
+            member_name = changed_result["member_name"]
+            admin_emails = changed_result["admin_emails"]
+            body = f"""
+            Hello Team,
+
+            Below user has been removed from {group_name} security group as part of direct user cleanup:
+            
+            Project: {project_name}
+            User Name: {member_name}
+            """
+
+            if not args.dry_run:
+                for admin_email in admin_emails:
+                    send_email(
+                        smtp_host="appmailrelay.fcpd.fcbint.net",
+                        smtp_port=25,
+                        sender_email="devops@firstcitizens.com",
+                        receiver_email=admin_email,
+                        subject="Azure DevOps Direct User Cleanup",
+                        body=body,
+                    )
+            else:
+                print(
+                    f"[Dry-run] Would send email to {admin_emails} for {member_name} user in  {group_name} group."
+                )
+
+    else:
+        print("No changes made. Skipping CSV export.")
+
+
+if __name__ == "__main__":
+    main()
