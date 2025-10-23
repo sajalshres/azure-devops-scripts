@@ -1,83 +1,35 @@
-# --- only the AzureDevOpsSession class change ---
-
-class AzureDevOpsSession:
-    """Encapsulates Azure DevOps REST API calls using aiohttp."""
-
-    def __init__(self, org_url, pat, api_version="7.1-preview", dry_run=True):
-        self.org_url = org_url.rstrip("/")
-        self.pat = pat
-        self.api_version = api_version
-        self.dry_run = dry_run
-        self.session = None
-
-        self.organization = self.org_url.split("/")[-1]
-        self.release_url = (
-            f"https://azdos-dev.fcpd.fcbint.net/{self.organization}"
-            if "azdos-dev.fcbint.net" in self.org_url
-            else self.org_url
-        )
-
-        pat_b64 = base64.b64encode(f":{pat}".encode()).decode()
-        self.headers = {
-            "Authorization": f"Basic {pat_b64}",
-            "Content-Type": "application/json",
-        }
-
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession(headers=self.headers)
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.session.close()
-
-    async def _request(self, method, url, json_data=None):
-        async with self.session.request(method, url, json=json_data) as response:
-            if response.status >= 400:
-                text = await response.text()
-                raise AzureDevOpsRequestException(
-                    request_method=method,
-                    request_url=url,
-                    response_status_code=response.status,
-                    response_text=text,
-                    message=f"{method} {url} failed: {response.status} - {text}",
-                )
-            return await response.json()
-
-    async def get_team_admin_emails(self, project, default_email="devsecops@firstcitizens.com"):
-        """
-        On-prem Azure DevOps Server compatible:
-        Returns list of Team Admin emails or default fallback.
-        Uses requests library since on-prem graph API differs from cloud.
-        """
-        import requests
+async def process_definition(azdo, project, definition, target_env_name, semaphore):
+    async with semaphore:
+        def_id = definition["id"]
         try:
-            url_teams = f"{self.org_url}/{project}/_apis/teams?api-version=7.1-preview.1"
-            resp = requests.get(url_teams, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
-            if resp.status_code != 200:
-                print(f"[WARN] Failed to fetch teams for {project}: {resp.status_code}")
-                return [default_email]
+            full_def = await azdo.get_release_definition(project, def_id)
+            result = {
+                "project": project,
+                "definition_id": def_id,
+                "definition_name": full_def["name"],
+                "env_name": None,
+                "updated": False,
+                "status": ""
+            }
 
-            teams = resp.json().get("value", [])
-            admin_emails = []
+            for env in full_def.get("environments", []):
+                if env["name"].lower() == target_env_name.lower():
+                    result["env_name"] = env["name"]
+                    opts = env["preDeployApprovals"]["approvalOptions"]
+                    if opts.get("releaseCreatorCanBeApprover", True):
+                        # Script updates it
+                        opts["releaseCreatorCanBeApprover"] = False
+                        result["updated"] = True
+                        result["status"] = "Updated"
+                        print(f"Updated '{env['name']}' in '{full_def['name']}' ({project})")
+                        await azdo.update_release_definition(project, full_def)
+                    else:
+                        # Already compliant; still include in report
+                        result["updated"] = True
+                        result["status"] = "Already compliant"
+                        print(f"Already compliant '{env['name']}' in '{full_def['name']}' ({project})")
 
-            for team in teams:
-                team_id = team.get("id")
-                members_url = f"{self.org_url}/_apis/projects/{project}/teams/{team_id}/members?api-version=7.1-preview.1"
-                m_resp = requests.get(members_url, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
-                if m_resp.status_code == 200:
-                    members = m_resp.json().get("value", [])
-                    for m in members:
-                        if m.get("isTeamAdmin", False):
-                            mail = m.get("uniqueName", "")
-                            if "@" in mail:
-                                admin_emails.append(mail)
-
-            if not admin_emails:
-                print(f"[WARN] No team admins found for {project}, using default email.")
-                return [default_email]
-
-            return list(set(admin_emails))
-
+            return result
         except Exception as e:
-            print(f"[ERROR] Exception fetching team admins for {project}: {e}")
-            return [default_email]
+            print(f"Failed to process definition '{definition.get('name')}' in '{project}': {str(e)}")
+            return {}
