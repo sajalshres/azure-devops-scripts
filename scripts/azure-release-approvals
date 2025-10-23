@@ -7,8 +7,15 @@ import os
 import smtplib
 from email.message import EmailMessage
 from urllib.parse import urljoin
+
 import aiohttp
+import urllib3
 from dotenv import load_dotenv
+from urllib3.exceptions import InsecureRequestWarning
+
+# Suppress InsecureRequestWarning
+urllib3.disable_warnings(InsecureRequestWarning)
+
 
 # --- Load dotenv file if configured ---
 def load_env_file(env_file_arg: str = None):
@@ -25,6 +32,7 @@ def load_env_file(env_file_arg: str = None):
     else:
         print("No .env file loaded (specify --env-file or AZDO_DOTENV_FILE if needed)")
 
+
 # --- Export only updated rows to CSV ---
 def export_to_csv(data, fieldnames, target_path=None):
     updated_data = [d for d in data if d.get("updated")]
@@ -37,14 +45,18 @@ def export_to_csv(data, fieldnames, target_path=None):
         writer.writerows(updated_data)
     return True
 
+
 # --- Azure DevOps exceptions ---
 class AzureDevOpsRequestException(Exception):
-    def __init__(self, request_method, request_url, response_status_code, response_text, message):
+    def __init__(
+        self, request_method, request_url, response_status_code, response_text, message
+    ):
         self.request_method = request_method
         self.request_url = request_url
         self.response_status_code = response_status_code
         self.response_text = response_text
         super().__init__(message)
+
 
 # --- Azure DevOps session ---
 class AzureDevOpsSession:
@@ -110,27 +122,38 @@ class AzureDevOpsSession:
     async def update_release_definition(self, project, definition):
         url = f"{self.release_url}/{project}/_apis/release/definitions/{definition['id']}?api-version={self.api_version}"
         if self.dry_run:
-            print(f"Dry-run: Would update definition '{definition['name']}' in project '{project}'")
+            print(
+                f"Dry-run: Would update definition '{definition['name']}' in project '{project}'"
+            )
             return
         try:
             response = await self._request("PUT", url, json_data=definition)
             print(f"Updated definition '{definition['name']}' in project '{project}'")
             return response
         except AzureDevOpsRequestException as error:
-            print(f"Failed to update definition '{definition.get('name')}' in '{project}': {str(error)}")
+            print(
+                f"Failed to update definition '{definition.get('name')}' in '{project}': {str(error)}"
+            )
             return None
 
-    async def get_team_admin_emails(self, project, default_email="devsecops@firstcitizens.com"):
+    async def get_team_admin_emails(
+        self, project, default_email="devsecops@firstcitizens.com"
+    ):
         """
         On-prem Azure DevOps Server compatible:
         Returns list of Team Admin emails including AD group members.
         Uses requests library since on-prem graph API differs from cloud.
         """
         import requests
+
         admin_emails = set()
         try:
-            url_teams = f"{self.org_url}/{project}/_apis/teams?api-version=7.1-preview.1"
-            resp = requests.get(url_teams, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
+            url_teams = (
+                f"{self.org_url}/{project}/_apis/teams?api-version=7.1-preview.1"
+            )
+            resp = requests.get(
+                url_teams, headers={"Authorization": f"Basic {self.pat}"}, verify=False
+            )
             if resp.status_code != 200:
                 print(f"[WARN] Failed to fetch teams for {project}: {resp.status_code}")
                 return [default_email]
@@ -139,7 +162,11 @@ class AzureDevOpsSession:
             for team in teams:
                 team_id = team.get("id")
                 members_url = f"{self.org_url}/_apis/projects/{project}/teams/{team_id}/members?api-version=7.1-preview.1"
-                m_resp = requests.get(members_url, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
+                m_resp = requests.get(
+                    members_url,
+                    headers={"Authorization": f"Basic {self.pat}"},
+                    verify=False,
+                )
                 if m_resp.status_code != 200:
                     continue
                 members = m_resp.json().get("value", [])
@@ -154,7 +181,11 @@ class AzureDevOpsSession:
                             # fetch group members
                             group_id = m.get("id")
                             members_api = f"{self.org_url}/_apis/identities/{group_id}/members?api-version=7.1-preview.1"
-                            g_resp = requests.get(members_api, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
+                            g_resp = requests.get(
+                                members_api,
+                                headers={"Authorization": f"Basic {self.pat}"},
+                                verify=False,
+                            )
                             if g_resp.status_code == 200:
                                 for gm in g_resp.json().get("value", []):
                                     mail = gm.get("uniqueName")
@@ -162,7 +193,9 @@ class AzureDevOpsSession:
                                         admin_emails.add(mail)
 
             if not admin_emails:
-                print(f"[WARN] No team admins found for {project}, using default email.")
+                print(
+                    f"[WARN] No team admins found for {project}, using default email."
+                )
                 return [default_email]
 
             return list(admin_emails)
@@ -171,19 +204,20 @@ class AzureDevOpsSession:
             print(f"[ERROR] Exception fetching team admins for {project}: {e}")
             return [default_email]
 
+
 # --- Async release update helpers ---
 async def process_definition(azdo, project, definition, target_env_name, semaphore):
     async with semaphore:
         def_id = definition["id"]
         try:
             full_def = await azdo.get_release_definition(project, def_id)
-            updated = False
             result = {
                 "project": project,
                 "definition_id": def_id,
                 "definition_name": full_def["name"],
                 "env_name": None,
-                "updated": updated,
+                "updated": False,
+                "status": "Already compliant",
             }
 
             for env in full_def.get("environments", []):
@@ -191,26 +225,38 @@ async def process_definition(azdo, project, definition, target_env_name, semapho
                     opts = env["preDeployApprovals"]["approvalOptions"]
                     if opts.get("releaseCreatorCanBeApprover", True):
                         opts["releaseCreatorCanBeApprover"] = False
-                        updated = True
                         result["updated"] = True
+                        result["status"] = "Updated by script"
                         result["env_name"] = env["name"]
-                        print(f"Updated '{env['name']}' in '{full_def['name']}' ({project})")
+                        print(
+                            f"Updated '{env['name']}' in '{full_def['name']}' ({project})"
+                        )
                     else:
-                        print(f"Already enforced for '{env['name']}' in '{full_def['name']}' ({project})")
-            if updated:
-                await azdo.update_release_definition(project, full_def)
+                        result["status"] = "Already compliant"
+                        result["env_name"] = env["name"]
+                        print(
+                            f"Already enforced for '{env['name']}' in '{full_def['name']}' ({project})"
+                        )
+
             return result
         except Exception as e:
-            print(f"Failed to update definition '{definition.get('name')}' in '{project}': {str(e)}")
-    return {}
+            print(
+                f"Failed to process definition '{definition.get('name')}' in '{project}': {str(e)}"
+            )
+            return {}
+
 
 async def process_project(azdo, project, target_env_name, semaphore):
     try:
         release_defs = await azdo.get_release_definitions(project)
-        tasks = [process_definition(azdo, project, rdef, target_env_name, semaphore) for rdef in release_defs]
+        tasks = [
+            process_definition(azdo, project, rdef, target_env_name, semaphore)
+            for rdef in release_defs
+        ]
         return await asyncio.gather(*tasks)
     except Exception as e:
         print(f"Error in project '{project}': {str(e)}")
+
 
 # --- Email with CSV ---
 def send_email_with_csv(recipients, csv_file):
@@ -232,12 +278,18 @@ def send_email_with_csv(recipients, csv_file):
     msg.set_content(
         "Hello Team,\n\n"
         "Please find attached the latest Azure DevOps release approval audit report.\n"
+        "It lists releases that violated approval policies ([Checked] The user requesting a release or deployment should not approve it).\n"
         "Only updated projects are included.\n\n"
         "Regards,\nDevSecOps Automation"
     )
 
     with open(csv_file, "rb") as f:
-        msg.add_attachment(f.read(), maintype="application", subtype="octet-stream", filename=os.path.basename(csv_file))
+        msg.add_attachment(
+            f.read(),
+            maintype="application",
+            subtype="octet-stream",
+            filename=os.path.basename(csv_file),
+        )
 
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
@@ -247,22 +299,43 @@ def send_email_with_csv(recipients, csv_file):
     except Exception as e:
         print(f"[ERROR] Failed to send email: {e}")
 
+
 # --- Main async workflow ---
-async def main(org_url, pat, target_env_name, dry_run, concurrency, single_project, output_path):
+async def main(
+    org_url, pat, target_env_name, dry_run, concurrency, single_project, output_path
+):
     semaphore = asyncio.Semaphore(concurrency)
     async with AzureDevOpsSession(org_url, pat, dry_run=dry_run) as azdo:
         if single_project:
             print(f"Running for single project: {single_project}")
             projects = [single_project]
-            results = await process_project(azdo, single_project, target_env_name, semaphore)
+            results = await process_project(
+                azdo, single_project, target_env_name, semaphore
+            )
         else:
             projects = await azdo.get_all_projects()
-            tasks = [process_project(azdo, project, target_env_name, semaphore) for project in projects]
+            tasks = [
+                process_project(azdo, project, target_env_name, semaphore)
+                for project in projects
+            ]
             results = await asyncio.gather(*tasks)
 
-        final_result = [item for sublist in results if sublist for item in sublist if item]
+        final_result = [
+            item for sublist in results if sublist for item in sublist if item
+        ]
         if final_result:
-            exported = export_to_csv(final_result, ["project", "definition_id", "definition_name", "env_name", "updated"], target_path=output_path)
+            exported = export_to_csv(
+                final_result,
+                [
+                    "project",
+                    "definition_id",
+                    "definition_name",
+                    "env_name",
+                    "updated",
+                    "status",
+                ],
+                target_path=output_path,
+            )
             if exported:
                 print("[INFO] CSV export completed successfully.")
         else:
@@ -277,17 +350,36 @@ async def main(org_url, pat, target_env_name, dry_run, concurrency, single_proje
 
         send_email_with_csv(all_admin_emails, output_path)
 
+
 # --- CLI ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Set 'releaseCreatorCanBeApprover = false' and send audit report.")
-    parser.add_argument("--env-file", default=None, help="Path to .env file (or set AZDO_DOTENV_FILE)")
-    parser.add_argument("--org-url", default=os.environ.get("AZDO_ORG_URL"), help="Azure DevOps org URL")
-    parser.add_argument("--pat", default=os.environ.get("AZDO_PAT"), help="Azure DevOps PAT")
-    parser.add_argument("--env", default=os.environ.get("AZDO_TARGET_ENV", "prod"), help="Target environment name")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate updates without applying them")
-    parser.add_argument("--concurrency", type=int, default=int(os.environ.get("AZDO_CONCURRENCY", 4)))
+    parser = argparse.ArgumentParser(
+        description="Set 'releaseCreatorCanBeApprover = false' and send audit report."
+    )
+    parser.add_argument(
+        "--env-file", default=None, help="Path to .env file (or set AZDO_DOTENV_FILE)"
+    )
+    parser.add_argument(
+        "--org-url", default=os.environ.get("AZDO_ORG_URL"), help="Azure DevOps org URL"
+    )
+    parser.add_argument(
+        "--pat", default=os.environ.get("AZDO_PAT"), help="Azure DevOps PAT"
+    )
+    parser.add_argument(
+        "--env",
+        default=os.environ.get("AZDO_TARGET_ENV", "prod"),
+        help="Target environment name",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Simulate updates without applying them"
+    )
+    parser.add_argument(
+        "--concurrency", type=int, default=int(os.environ.get("AZDO_CONCURRENCY", 4))
+    )
     parser.add_argument("--project", default=None, help="Specific project name")
-    parser.add_argument("--output", default="audit_release_approvals.csv", help="Output CSV file")
+    parser.add_argument(
+        "--output", default="audit_release_approvals.csv", help="Output CSV file"
+    )
 
     args = parser.parse_args()
     load_env_file(args.env_file)
@@ -295,4 +387,14 @@ if __name__ == "__main__":
         raise ValueError("Missing --org-url or --pat")
 
     print(f"Org URL: {args.org_url}, Target Env: {args.env}, Dry Run: {args.dry_run}")
-    asyncio.run(main(args.org_url, args.pat, args.env, args.dry_run, args.concurrency, args.project, args.output))
+    asyncio.run(
+        main(
+            args.org_url,
+            args.pat,
+            args.env,
+            args.dry_run,
+            args.concurrency,
+            args.project,
+            args.output,
+        )
+    )
