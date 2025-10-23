@@ -1,32 +1,65 @@
-async def get_team_admin_emails(self, project, default_email="devops@firstcitizens.com"):
-    try:
-        url = f"{self.org_url}/{project}/_apis/graph/groups?scopeDescriptor=Project&api-version={self.api_version}"
+def send_email_with_csv_if_updates(recipients, csv_file):
+    """
+    Send email with CSV attachment only if CSV exists and has updates.
+    Each recipient is sent separately to avoid SMTP disconnect issues.
+    Includes retry and graceful fallback handling.
+    """
+    import smtplib
+    from email.message import EmailMessage
+    import os
+    import time
+
+    SMTP_SERVER = "appmailrelay.fcpd.fcbint.net"
+    SMTP_PORT = 25
+    DEFAULT_DEVSECOPS_EMAIL = "devsecops@firstcitizens.com"
+
+    # Ensure file exists
+    if not os.path.exists(csv_file):
+        print(f"[INFO] CSV file '{csv_file}' not found. Skipping email.")
+        return
+
+    # Skip if empty (no updates)
+    if os.path.getsize(csv_file) == 0:
+        print("[INFO] CSV file is empty. No updates to report. Skipping email.")
+        return
+
+    recipients = recipients or [DEFAULT_DEVSECOPS_EMAIL]
+
+    for recipient in recipients:
         try:
-            groups = await self._request("GET", url)
-        except AzureDevOpsRequestException as e:
-            if e.response_status_code == 404:
-                print(f"[INFO] Graph API not supported for project '{project}', using default email")
-                return [default_email]
-            raise e
+            msg = EmailMessage()
+            msg["From"] = "devops@firstcitizens.com"
+            msg["To"] = recipient
+            msg["Subject"] = "Azure DevOps Release Approval Audit - Summary Report"
+            msg.set_content(
+                "Hello Team,\n\n"
+                "Please find attached the latest Azure DevOps release approval audit report.\n\n"
+                "Regards,\nDevSecOps Automation"
+            )
 
-        if not groups or "value" not in groups:
-            print(f"[WARN] No group data for project '{project}', using default email")
-            return [default_email]
+            with open(csv_file, "rb") as f:
+                msg.add_attachment(
+                    f.read(),
+                    maintype="application",
+                    subtype="octet-stream",
+                    filename=os.path.basename(csv_file),
+                )
 
-        team_admin = next((g for g in groups.get("value", []) if "Team Admin" in g.get("displayName", "")), None)
-        if not team_admin:
-            print(f"No Team Admin group found for project '{project}', using default email")
-            return [default_email]
+            # Retry up to 3 times for each recipient
+            for attempt in range(3):
+                try:
+                    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
+                        server.ehlo()  # Proper handshake
+                        server.send_message(msg)
+                    print(f"[INFO] Email sent to: {recipient}")
+                    break  # success
+                except smtplib.SMTPServerDisconnected:
+                    print(f"[WARN] Disconnected while sending to {recipient}, retrying ({attempt+1}/3)...")
+                    time.sleep(2)
+                except Exception as e:
+                    raise e
+            else:
+                print(f"[ERROR] Giving up after 3 attempts for {recipient}")
 
-        url_members = f"{self.org_url}/_apis/graph/groups/{team_admin['descriptor']}/members?api-version={self.api_version}"
-        members_data = await self._request("GET", url_members)
-        if not members_data or "value" not in members_data:
-            print(f"[WARN] No members found in Team Admin for project '{project}', using default email")
-            return [default_email]
-
-        emails = [m["principalName"] for m in members_data.get("value", []) if m.get("principalName")]
-        return emails or [default_email]
-
-    except Exception as e:
-        print(f"[WARN] Unexpected error fetching Team Admin for project '{project}': {e}. Using default email.")
-        return [default_email]
+        except Exception as e:
+            print(f"[ERROR] Failed to send email to {recipient}: {e}")
