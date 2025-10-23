@@ -1,37 +1,13 @@
-Traceback (most recent call last):
-  File "D:\AzdoData\_work1\141\s\Python\azdo_release_approvals\main.py", line 386, in <module>
-    asyncio.run(
-    ~~~~~~~~~~~^
-        main(
-        ^^^^^
-    ...<7 lines>...
-        )
-        ^
-    )
-    ^
-  File "C:\Program Files\Python314\Lib\asyncio\runners.py", line 204, in run
-    return runner.run(main)
-           ~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python314\Lib\asyncio\runners.py", line 127, in run
-    return self._loop.run_until_complete(task)
-           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
-  File "C:\Program Files\Python314\Lib\asyncio\base_events.py", line 719, in run_until_complete
-    return future.result()
-           ~~~~~~~~~~~~~^^
-  File "D:\AzdoData\_work1\141\s\Python\azdo_release_approvals\main.py", line 330, in main
-    exported = export_to_csv(
-        final_result,
-        ["project", "definition_id", "definition_name", "env_name", "updated"],
-        target_path=output_path,
-    )
-  File "D:\AzdoData\_work1\141\s\Python\azdo_release_approvals\main.py", line 45, in export_to_csv
-    writer.writerows(updated_data)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
-  File "C:\Program Files\Python314\Lib\csv.py", line 228, in writerows
-    return self.writer.writerows(map(self._dict_to_list, rowdicts))
-           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Program Files\Python314\Lib\csv.py", line 220, in _dict_to_list
-    raise ValueError("dict contains fields not in fieldnames: "
-                     + ", ".join([repr(x) for x in wrong_fields]))
-ValueError: dict contains fields not in fieldnames: 'status'
-##[error]Cmd.exe exited with code '1'.
+for env in full_def.get("environments", []):
+    if env["name"].lower() == target_env_name.lower():
+        opts = env["preDeployApprovals"]["approvalOptions"]
+        if opts.get("releaseCreatorCanBeApprover", True):
+            opts["releaseCreatorCanBeApprover"] = False
+            result["updated"] = True
+            result["status"] = "Updated by script"
+            result["env_name"] = env["name"]
+            print(f"Updated '{env['name']}' in '{full_def['name']}' ({project})")
+        else:
+            result["status"] = "Already compliant"
+            result["env_name"] = env["name"]
+            print(f"Already enforced for '{env['name']}' in '{full_def['name']}' ({project})")
