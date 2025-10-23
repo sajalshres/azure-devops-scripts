@@ -9,6 +9,7 @@ from email.message import EmailMessage
 from urllib.parse import urljoin
 
 import aiohttp
+import requests
 import urllib3
 from dotenv import load_dotenv
 from urllib3.exceptions import InsecureRequestWarning
@@ -33,15 +34,16 @@ def load_env_file(env_file_arg: str = None):
         print("No .env file loaded (specify --env-file or AZDO_DOTENV_FILE if needed)")
 
 
-# --- Export all processed rows to CSV ---
+# --- Export only updated rows to CSV ---
 def export_to_csv(data, fieldnames, target_path=None):
-    if not data:
-        print("[INFO] No data to export.")
+    updated_data = [d for d in data if d.get("updated")]
+    if not updated_data:
+        print("[INFO] No updated data to export.")
         return False
     with open(target_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(data)
+        writer.writerows(updated_data)
     return True
 
 
@@ -135,62 +137,76 @@ class AzureDevOpsSession:
             )
             return None
 
+    # --- Updated admin email method using Direct User Cleanup logic ---
     async def get_team_admin_emails(
         self, project, default_email="devsecops@firstcitizens.com"
     ):
-        """
-        Returns list of Team Admin emails including AD group members.
-        """
-        import requests
-
+        """Fetch all team admins including nested AD group members."""
         admin_emails = set()
+        base_url = self.org_url
+
         try:
-            url_teams = f"{self.org_url}/{project}/_apis/teams?api-version=7.1-preview.1"
+            # Fetch project security groups
+            url_groups = f"{base_url}/{project}/_api/_identity/ReadScopedApplicationGroupsJson?__v=5"
             resp = requests.get(
-                url_teams, headers={"Authorization": f"Basic {self.pat}"}, verify=False
+                url_groups,
+                headers={"Authorization": f"Basic {base64.b64encode(f':{self.pat}'.encode()).decode()}"},
+                verify=False,
             )
             if resp.status_code != 200:
-                print(f"[WARN] Failed to fetch teams for {project}: {resp.status_code}")
+                print(f"[WARN] Failed to fetch groups for {project}: {resp.status_code}")
                 return [default_email]
 
-            teams = resp.json().get("value", [])
-            for team in teams:
-                team_id = team.get("id")
-                members_url = f"{self.org_url}/_apis/projects/{project}/teams/{team_id}/members?api-version=7.1-preview.1"
-                m_resp = requests.get(
-                    members_url, headers={"Authorization": f"Basic {self.pat}"}, verify=False
-                )
-                if m_resp.status_code != 200:
-                    continue
-                members = m_resp.json().get("value", [])
-                for m in members:
-                    if not m.get("isTeamAdmin", False):
-                        continue
+            groups = resp.json().get("identities", [])
+            priority_names = ["Team Admins", "Project Administrator"]
 
-                    principal_type = m.get("identityType")  # "user" or "group"
-                    principal_id = m.get("id")
-                    if principal_type == "user":
-                        email = m.get("uniqueName")
-                        if email and "@" in email:
-                            admin_emails.add(email)
-                    elif principal_type == "group":
-                        # Resolve AD group members
-                        group_members_url = f"{self.org_url}/_apis/graph/groups/{principal_id}/members?api-version=7.1-preview.1"
-                        g_resp = requests.get(group_members_url, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
-                        if g_resp.status_code == 200:
-                            for gm in g_resp.json().get("value", []):
-                                if gm.get("principalType") == "User":
-                                    email = gm.get("principalName")
-                                    if email and "@" in email:
-                                        admin_emails.add(email)
+            # Resolve first matching priority group
+            for priority_name in priority_names:
+                for group in groups:
+                    if group.get("FriendlyDisplayName", "").lower() == priority_name.lower():
+                        group_id = group.get("TeamFoundationId")
+                        members_url = f"{base_url}/_api/_identity/ReadGroupMembers?__v=5&scope={group_id}&readMembers=true"
+                        m_resp = requests.get(
+                            members_url,
+                            headers={"Authorization": f"Basic {base64.b64encode(f':{self.pat}'.encode()).decode()}"},
+                            verify=False,
+                        )
+                        if m_resp.status_code != 200:
+                            continue
+                        members = m_resp.json().get("identities", [])
+                        for member in members:
+                            identity_type = member.get("IdentityType")
+                            if identity_type.lower() == "user":
+                                mail = member.get("MailAddress")
+                                if mail:
+                                    admin_emails.add(mail)
+                            elif identity_type.lower() == "group":
+                                # Nested AD group
+                                group_entity_id = member["EntityId"]
+                                try:
+                                    ad_members_url = (
+                                        f"{base_url}/_apis/IdentityPicker/Identities/{group_entity_id}/connections?"
+                                        "identityTypes%5B%5D=user&identityTypes%5B%5D=group&operationScopes%5B%5D=ims"
+                                        "&operationScopes%5B%5D=source&connectionTypes%5B%5D=successors&depth=1"
+                                        "&properties%5B%5D=Mail"
+                                    )
+                                    g_resp = requests.get(
+                                        ad_members_url,
+                                        headers={"Authorization": f"Basic {base64.b64encode(f':{self.pat}'.encode()).decode()}"},
+                                        verify=False,
+                                    )
+                                    if g_resp.status_code == 200:
+                                        for gm in g_resp.json().get("successors", []):
+                                            if gm.get("entityType") == "User" and gm.get("mail"):
+                                                admin_emails.add(gm.get("mail"))
+                                except Exception as e:
+                                    print(f"[WARN] Failed to resolve AD group {member.get('DisplayName')}: {e}")
 
             if not admin_emails:
                 return [default_email]
-
             return list(admin_emails)
-
         except Exception as e:
-            print(f"[ERROR] fetching team admin emails for {project}: {e}")
+            print(f"[ERROR] Exception fetching team admins for {project}: {e}")
             return [default_email]
 
 
@@ -216,16 +232,16 @@ async def process_definition(azdo, project, definition, target_env_name, semapho
                         opts["releaseCreatorCanBeApprover"] = False
                         result["updated"] = True
                         result["status"] = "Updated by script"
+                        result["env_name"] = env["name"]
+                        print(
+                            f"Updated '{env['name']}' in '{full_def['name']}' ({project})"
+                        )
                     else:
                         result["status"] = "Already compliant"
-                    result["env_name"] = env["name"]
-                    print(
-                        f"{result['status']} for '{env['name']}' in '{full_def['name']}' ({project})"
-                    )
-
-            # Update the release if required
-            if result["updated"]:
-                await azdo.update_release_definition(project, full_def)
+                        result["env_name"] = env["name"]
+                        print(
+                            f"Already enforced for '{env['name']}' in '{full_def['name']}' ({project})"
+                        )
 
             return result
         except Exception as e:
@@ -267,8 +283,7 @@ def send_email_with_csv(recipients, csv_file):
     msg.set_content(
         "Hello Team,\n\n"
         "Please find attached the latest Azure DevOps release approval audit report.\n"
-        "It includes release pipelines that have been updated by the script or violated the approval policy "
-        "([Checked] The user requesting a release or deployment should not approve it).\n"
+        "It lists releases that violated approval policies ([Checked] The user requesting a release or deployment should not approve it).\n"
         "Only updated projects are included.\n\n"
         "Regards,\nDevSecOps Automation"
     )
@@ -313,7 +328,6 @@ async def main(
         final_result = [
             item for sublist in results if sublist for item in sublist if item
         ]
-
         if final_result:
             exported = export_to_csv(
                 final_result,
@@ -333,6 +347,7 @@ async def main(
             print("[INFO] No updates found — skipping CSV generation.")
             return
 
+        # --- Fetch all team admin emails using updated method ---
         all_admin_emails = []
         for project in projects:
             emails = await azdo.get_team_admin_emails(project)
