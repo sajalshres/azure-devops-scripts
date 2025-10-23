@@ -8,13 +8,12 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 from urllib.parse import urljoin
+
 import aiohttp
 from dotenv import load_dotenv
 
 
-# ---------------------------------------------------------
 # ENVIRONMENT
-# ---------------------------------------------------------
 def load_env_file(env_file_arg: str = None):
     env_file = (
         env_file_arg
@@ -31,9 +30,7 @@ def load_env_file(env_file_arg: str = None):
         print("No .env file loaded (specify --env-file or AZDO_DOTENV_FILE if needed)")
 
 
-# ---------------------------------------------------------
 # AZURE DEVOPS API SESSION
-# ---------------------------------------------------------
 class AzureDevOpsRequestException(Exception):
     pass
 
@@ -104,10 +101,14 @@ class AzureDevOpsSession:
             print(f"Updated definition '{definition['name']}' in '{project}'")
             return response
         except Exception as e:
-            print(f"Failed to update definition '{definition.get('name')}' in '{project}': {e}")
+            print(
+                f"Failed to update definition '{definition.get('name')}' in '{project}': {e}"
+            )
             return None
 
-    async def get_team_admin_emails(self, project, default_email="devops@firstcitizens.com"):
+    async def get_team_admin_emails(
+        self, project, default_email="devops@firstcitizens.com"
+    ):
         try:
             url = f"{self.org_url}/{project}/_apis/graph/groups?scopeDescriptor=Project&api-version={self.api_version}"
             groups = await self._request("GET", url)
@@ -115,7 +116,11 @@ class AzureDevOpsSession:
                 return [default_email]
 
             team_admin = next(
-                (g for g in groups["value"] if "Team Admin" in g.get("displayName", "")),
+                (
+                    g
+                    for g in groups["value"]
+                    if "Team Admin" in g.get("displayName", "")
+                ),
                 None,
             )
             if not team_admin:
@@ -133,9 +138,7 @@ class AzureDevOpsSession:
             return [default_email]
 
 
-# ---------------------------------------------------------
 # PROCESSING
-# ---------------------------------------------------------
 async def process_definition(azdo, project, definition, target_env_name, semaphore):
     async with semaphore:
         def_id = definition["id"]
@@ -166,24 +169,26 @@ async def process_definition(azdo, project, definition, target_env_name, semapho
                 }
 
         except Exception as e:
-            print(f"[ERROR] Failed to update '{definition.get('name')}' in '{project}': {e}")
+            print(
+                f"[ERROR] Failed to update '{definition.get('name')}' in '{project}': {e}"
+            )
     return None
 
 
 async def process_project(azdo, project, target_env_name, semaphore):
     try:
         release_defs = await azdo.get_release_definitions(project)
-        tasks = [process_definition(azdo, project, rdef, target_env_name, semaphore)
-                 for rdef in release_defs]
+        tasks = [
+            process_definition(azdo, project, rdef, target_env_name, semaphore)
+            for rdef in release_defs
+        ]
         return [r for r in await asyncio.gather(*tasks) if r]
     except Exception as e:
         print(f"[ERROR] Error in project '{project}': {e}")
         return []
 
 
-# ---------------------------------------------------------
 # EMAIL (simplified plain text, relay-safe)
-# ---------------------------------------------------------
 def send_email_summary(recipients, updates):
     if not updates:
         print("[INFO] No updates to email. Skipping.")
@@ -201,7 +206,9 @@ def send_email_summary(recipients, updates):
         "",
     ]
     for u in updates:
-        body_lines.append(f"• Project: {u['project']} | Definition: {u['definition_name']} | Env: {u['env_name']}")
+        body_lines.append(
+            f"• Project: {u['project']} | Definition: {u['definition_name']} | Env: {u['env_name']}"
+        )
     body_lines.append("")
     body_lines.append("Regards,")
     body_lines.append("DevSecOps Automation")
@@ -223,9 +230,7 @@ def send_email_summary(recipients, updates):
             print(f"[ERROR] Failed to send email to {recipient}: {e}")
 
 
-# ---------------------------------------------------------
 # MAIN LOGIC
-# ---------------------------------------------------------
 async def main(org_url, pat, target_env_name, dry_run, concurrency, single_project):
     semaphore = asyncio.Semaphore(concurrency)
     async with AzureDevOpsSession(org_url, pat, dry_run=dry_run) as azdo:
@@ -241,10 +246,10 @@ async def main(org_url, pat, target_env_name, dry_run, concurrency, single_proje
             all_updates.extend(updates)
 
         if not all_updates:
-            print("✅ No updates found across all projects.")
+            print("No updates found across all projects.")
             return
 
-        print(f"📊 Total updates: {len(all_updates)}")
+        print(f"Total updates: {len(all_updates)}")
         all_admin_emails = []
         for project in projects:
             emails = await azdo.get_team_admin_emails(project)
@@ -254,16 +259,18 @@ async def main(org_url, pat, target_env_name, dry_run, concurrency, single_proje
         send_email_summary(all_admin_emails, all_updates)
 
 
-# ---------------------------------------------------------
 # CLI ENTRY
-# ---------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Audit and enforce releaseCreatorCanBeApprover.")
+    parser = argparse.ArgumentParser(
+        description="Audit and enforce releaseCreatorCanBeApprover."
+    )
     parser.add_argument("--env-file", default=None, help="Path to .env file (optional)")
     parser.add_argument("--org-url", default=os.environ.get("AZDO_ORG_URL"))
     parser.add_argument("--pat", default=os.environ.get("AZDO_PAT"))
     parser.add_argument("--env", default=os.environ.get("AZDO_TARGET_ENV", "prod"))
-    parser.add_argument("--dry-run", action="store_true", help="Simulate without changes")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Simulate without changes"
+    )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--project", default=None)
     args = parser.parse_args()
@@ -272,7 +279,9 @@ if __name__ == "__main__":
     if not args.org_url or not args.pat:
         raise ValueError("Missing --org-url or --pat")
 
-    print(f"Running audit for org={args.org_url}, env={args.env}, project={args.project}, dry_run={args.dry_run}")
+    print(
+        f"Running audit for org={args.org_url}, env={args.env}, project={args.project}, dry_run={args.dry_run}"
+    )
 
     asyncio.run(
         main(
