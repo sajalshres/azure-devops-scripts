@@ -11,8 +11,7 @@ from urllib.parse import urljoin
 import aiohttp
 from dotenv import load_dotenv
 
-
-# Load dotenv file if configured
+# --- Load dotenv file if configured ---
 def load_env_file(env_file_arg: str = None):
     env_file = (
         env_file_arg
@@ -27,10 +26,9 @@ def load_env_file(env_file_arg: str = None):
     else:
         print("No .env file loaded (specify --env-file or AZDO_DOTENV_FILE if needed)")
 
-
+# --- Export only updated rows to CSV ---
 def export_to_csv(data, fieldnames, target_path=None):
-    """Exports only updated rows to CSV"""
-    updated_data = [d for d in data if d.get("updated")]  # filter only updated=True
+    updated_data = [d for d in data if d.get("updated")]
     if not updated_data:
         print("[INFO] No updated data to export.")
         return False
@@ -40,20 +38,16 @@ def export_to_csv(data, fieldnames, target_path=None):
         writer.writerows(updated_data)
     return True
 
-
-# Azure DevOps exceptions
+# --- Azure DevOps exceptions ---
 class AzureDevOpsRequestException(Exception):
-    def __init__(
-        self, request_method, request_url, response_status_code, response_text, message
-    ):
+    def __init__(self, request_method, request_url, response_status_code, response_text, message):
         self.request_method = request_method
         self.request_url = request_url
         self.response_status_code = response_status_code
         self.response_text = response_text
         super().__init__(message)
 
-
-# Azure DevOps Session
+# --- Azure DevOps session ---
 class AzureDevOpsSession:
     """Encapsulates Azure DevOps REST API calls using aiohttp."""
 
@@ -117,68 +111,57 @@ class AzureDevOpsSession:
     async def update_release_definition(self, project, definition):
         url = f"{self.release_url}/{project}/_apis/release/definitions/{definition['id']}?api-version={self.api_version}"
         if self.dry_run:
-            print(
-                f"Dry-run: Would update definition '{definition['name']}' in project '{project}'"
-            )
+            print(f"Dry-run: Would update definition '{definition['name']}' in project '{project}'")
             return
         try:
             response = await self._request("PUT", url, json_data=definition)
             print(f"Updated definition '{definition['name']}' in project '{project}'")
             return response
         except AzureDevOpsRequestException as error:
-            print(
-                f"Failed to update definition '{definition.get('name')}' in '{project}': {str(error)}"
-            )
+            print(f"Failed to update definition '{definition.get('name')}' in '{project}': {str(error)}")
             return None
 
-    async def get_team_admin_emails(
-        self, project, default_email="devsecops@firstcitizens.com"
-    ):
-        """Get Team Admin group member emails, fallback to DevSecOps if missing or empty"""
+    async def get_team_admin_emails(self, project, default_email="devsecops@firstcitizens.com"):
+        """
+        On-prem Azure DevOps Server compatible:
+        Returns list of Team Admin emails or default fallback.
+        Uses requests library since on-prem graph API differs from cloud.
+        """
+        import requests
         try:
-            url = f"{self.org_url}/{project}/_apis/graph/groups?scopeDescriptor=Project&api-version={self.api_version}"
-            groups = await self._request("GET", url)
-
-            if not groups or "value" not in groups:
-                print(f"[WARN] No groups in project '{project}', using default email.")
+            url_teams = f"{self.org_url}/{project}/_apis/teams?api-version=7.1-preview.1"
+            resp = requests.get(url_teams, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
+            if resp.status_code != 200:
+                print(f"[WARN] Failed to fetch teams for {project}: {resp.status_code}")
                 return [default_email]
 
-            team_admin = next(
-                (
-                    g
-                    for g in groups.get("value", [])
-                    if "Team Admin" in g.get("displayName", "")
-                ),
-                None,
-            )
-            if not team_admin:
-                print(
-                    f"[INFO] No Team Admin group found in '{project}', using default email."
-                )
+            teams = resp.json().get("value", [])
+            admin_emails = []
+
+            for team in teams:
+                team_id = team.get("id")
+                members_url = f"{self.org_url}/_apis/projects/{project}/teams/{team_id}/members?api-version=7.1-preview.1"
+                m_resp = requests.get(members_url, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
+                if m_resp.status_code == 200:
+                    members = m_resp.json().get("value", [])
+                    for m in members:
+                        if m.get("isTeamAdmin", False):
+                            mail = m.get("uniqueName", "")
+                            if "@" in mail:
+                                admin_emails.append(mail)
+
+            if not admin_emails:
+                print(f"[WARN] No team admins found for {project}, using default email.")
                 return [default_email]
 
-            url_members = f"{self.org_url}/_apis/graph/groups/{team_admin['descriptor']}/members?api-version={self.api_version}"
-            members_data = await self._request("GET", url_members)
-            if not members_data or "value" not in members_data:
-                print(
-                    f"[INFO] No members found in Team Admin for '{project}', using default email."
-                )
-                return [default_email]
-
-            emails = [
-                m["principalName"]
-                for m in members_data.get("value", [])
-                if m.get("principalName")
-            ]
-            return emails or [default_email]
+            return list(set(admin_emails))
 
         except Exception as e:
-            print(f"[WARN] Error fetching Team Admin emails for '{project}': {e}")
+            print(f"[ERROR] Exception fetching team admins for {project}: {e}")
             return [default_email]
 
-
+# --- Async release update helpers ---
 async def process_definition(azdo, project, definition, target_env_name, semaphore):
-    result = None
     async with semaphore:
         def_id = definition["id"]
         try:
@@ -200,50 +183,35 @@ async def process_definition(azdo, project, definition, target_env_name, semapho
                         updated = True
                         result["updated"] = True
                         result["env_name"] = env["name"]
-                        print(
-                            f"Updated '{env['name']}' in '{full_def['name']}' ({project})"
-                        )
+                        print(f"Updated '{env['name']}' in '{full_def['name']}' ({project})")
                     else:
-                        print(
-                            f"Already enforced for '{env['name']}' in '{full_def['name']}' ({project})"
-                        )
+                        print(f"Already enforced for '{env['name']}' in '{full_def['name']}' ({project})")
             if updated:
                 await azdo.update_release_definition(project, full_def)
             return result
         except Exception as e:
-            print(
-                f"Failed to update definition '{definition.get('name')}' in '{project}': {str(e)}"
-            )
+            print(f"Failed to update definition '{definition.get('name')}' in '{project}': {str(e)}")
     return {}
-
 
 async def process_project(azdo, project, target_env_name, semaphore):
     try:
         release_defs = await azdo.get_release_definitions(project)
-        tasks = [
-            process_definition(azdo, project, rdef, target_env_name, semaphore)
-            for rdef in release_defs
-        ]
+        tasks = [process_definition(azdo, project, rdef, target_env_name, semaphore) for rdef in release_defs]
         return await asyncio.gather(*tasks)
     except Exception as e:
         print(f"Error in project '{project}': {str(e)}")
 
-
+# --- Email with CSV ---
 def send_email_with_csv(recipients, csv_file):
     SMTP_SERVER = "appmailrelay.fcpd.fcbint.net"
     SMTP_PORT = 25
 
-    # Filter recipients & always include DevSecOps
     recipients = list(set(recipients or []))
     if "devsecops@firstcitizens.com" not in recipients:
         recipients.append("devsecops@firstcitizens.com")
 
-    if not os.path.exists(csv_file):
-        print(f"[INFO] No CSV found at '{csv_file}', skipping email.")
-        return
-
-    if os.path.getsize(csv_file) == 0:
-        print("[INFO] CSV is empty — no updates to email.")
+    if not os.path.exists(csv_file) or os.path.getsize(csv_file) == 0:
+        print("[INFO] CSV not found or empty — skipping email.")
         return
 
     msg = EmailMessage()
@@ -258,12 +226,7 @@ def send_email_with_csv(recipients, csv_file):
     )
 
     with open(csv_file, "rb") as f:
-        msg.add_attachment(
-            f.read(),
-            maintype="application",
-            subtype="octet-stream",
-            filename=os.path.basename(csv_file),
-        )
+        msg.add_attachment(f.read(), maintype="application", subtype="octet-stream", filename=os.path.basename(csv_file))
 
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
@@ -273,7 +236,7 @@ def send_email_with_csv(recipients, csv_file):
     except Exception as e:
         print(f"[ERROR] Failed to send email: {e}")
 
-
+# --- Main async workflow ---
 async def main(org_url, pat, target_env_name, dry_run, concurrency, single_project, output_path):
     semaphore = asyncio.Semaphore(concurrency)
     async with AzureDevOpsSession(org_url, pat, dry_run=dry_run) as azdo:
@@ -283,19 +246,12 @@ async def main(org_url, pat, target_env_name, dry_run, concurrency, single_proje
             results = await process_project(azdo, single_project, target_env_name, semaphore)
         else:
             projects = await azdo.get_all_projects()
-            tasks = [
-                process_project(azdo, project, target_env_name, semaphore)
-                for project in projects
-            ]
+            tasks = [process_project(azdo, project, target_env_name, semaphore) for project in projects]
             results = await asyncio.gather(*tasks)
 
         final_result = [item for sublist in results if sublist for item in sublist if item]
         if final_result:
-            exported = export_to_csv(
-                data=final_result,
-                fieldnames=["project", "definition_id", "definition_name", "env_name", "updated"],
-                target_path=output_path,
-            )
+            exported = export_to_csv(final_result, ["project", "definition_id", "definition_name", "env_name", "updated"], target_path=output_path)
             if exported:
                 print("[INFO] CSV export completed successfully.")
         else:
@@ -310,12 +266,9 @@ async def main(org_url, pat, target_env_name, dry_run, concurrency, single_proje
 
         send_email_with_csv(all_admin_emails, output_path)
 
-
-# CLI
+# --- CLI ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Set 'releaseCreatorCanBeApprover = false' and send audit report."
-    )
+    parser = argparse.ArgumentParser(description="Set 'releaseCreatorCanBeApprover = false' and send audit report.")
     parser.add_argument("--env-file", default=None, help="Path to .env file (or set AZDO_DOTENV_FILE)")
     parser.add_argument("--org-url", default=os.environ.get("AZDO_ORG_URL"), help="Azure DevOps org URL")
     parser.add_argument("--pat", default=os.environ.get("AZDO_PAT"), help="Azure DevOps PAT")
@@ -331,6 +284,4 @@ if __name__ == "__main__":
         raise ValueError("Missing --org-url or --pat")
 
     print(f"Org URL: {args.org_url}, Target Env: {args.env}, Dry Run: {args.dry_run}")
-    asyncio.run(
-        main(args.org_url, args.pat, args.env, args.dry_run, args.concurrency, args.project, args.output)
-    )
+    asyncio.run(main(args.org_url, args.pat, args.env, args.dry_run, args.concurrency, args.project, args.output))
