@@ -1,53 +1,83 @@
-[WARN] Error fetching Team Admin emails for 'Banking-CBG': GET https://azdos-dev.fcpd.fcbint.net/CITMain/Banking-CBG/_apis/graph/groups?scopeDescriptor=Project&api-version=7.1-preview failed: 404 - 
+# --- only the AzureDevOpsSession class change ---
 
-<!DOCTYPE html>
+class AzureDevOpsSession:
+    """Encapsulates Azure DevOps REST API calls using aiohttp."""
 
-<html>
+    def __init__(self, org_url, pat, api_version="7.1-preview", dry_run=True):
+        self.org_url = org_url.rstrip("/")
+        self.pat = pat
+        self.api_version = api_version
+        self.dry_run = dry_run
+        self.session = None
 
-    <head>
+        self.organization = self.org_url.split("/")[-1]
+        self.release_url = (
+            f"https://azdos-dev.fcpd.fcbint.net/{self.organization}"
+            if "azdos-dev.fcbint.net" in self.org_url
+            else self.org_url
+        )
 
-        <title>Page not found - Azure DevOps Server</title>
+        pat_b64 = base64.b64encode(f":{pat}".encode()).decode()
+        self.headers = {
+            "Authorization": f"Basic {pat_b64}",
+            "Content-Type": "application/json",
+        }
 
-        <style type="text/css">
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(headers=self.headers)
+        return self
 
-            body,button { font-family: Segoe UI, Helvetica Neue, Helvetica, Arial, Verdana; font-size: 16px; }
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.session.close()
 
-            body { height: 100% }
+    async def _request(self, method, url, json_data=None):
+        async with self.session.request(method, url, json=json_data) as response:
+            if response.status >= 400:
+                text = await response.text()
+                raise AzureDevOpsRequestException(
+                    request_method=method,
+                    request_url=url,
+                    response_status_code=response.status,
+                    response_text=text,
+                    message=f"{method} {url} failed: {response.status} - {text}",
+                )
+            return await response.json()
 
-            A { color: #106ebe; text-decoration: none; }
+    async def get_team_admin_emails(self, project, default_email="devsecops@firstcitizens.com"):
+        """
+        On-prem Azure DevOps Server compatible:
+        Returns list of Team Admin emails or default fallback.
+        Uses requests library since on-prem graph API differs from cloud.
+        """
+        import requests
+        try:
+            url_teams = f"{self.org_url}/{project}/_apis/teams?api-version=7.1-preview.1"
+            resp = requests.get(url_teams, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
+            if resp.status_code != 200:
+                print(f"[WARN] Failed to fetch teams for {project}: {resp.status_code}")
+                return [default_email]
 
-            A:hover { text-decoration: underline; }
+            teams = resp.json().get("value", [])
+            admin_emails = []
 
-            h1 { font-size: 32px; color: #666; margin-bottom: 0px; }
+            for team in teams:
+                team_id = team.get("id")
+                members_url = f"{self.org_url}/_apis/projects/{project}/teams/{team_id}/members?api-version=7.1-preview.1"
+                m_resp = requests.get(members_url, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
+                if m_resp.status_code == 200:
+                    members = m_resp.json().get("value", [])
+                    for m in members:
+                        if m.get("isTeamAdmin", False):
+                            mail = m.get("uniqueName", "")
+                            if "@" in mail:
+                                admin_emails.append(mail)
 
-            h2 { font-size: 24px; color: #666; font-weight: normal; margin-top: 0px; }
+            if not admin_emails:
+                print(f"[WARN] No team admins found for {project}, using default email.")
+                return [default_email]
 
-            pre { font-family: Consolas, Courier New, monospace; font-size: 12px; border: 1px solid #ccc; background-color: #eaeaea; padding: 10px;}
+            return list(set(admin_emails))
 
-            #moreInfoButton { background: transparent; border: 0; color: #106ebe; cursor: pointer; }
-
-                
-
-        </style>
-
-        <script type="text/javascript">
-
-            function toggle(event) {
-
-                if (!event.key || event.key === " " || event.key === "Spacebar" || event.key === "Enter") {
-
-                    var icon = document.getElementById("moreInfoIcon");
-
-                    var section = document.getElementById("moreInfo");
-
-                    var wasShowing = section.style.display === "";
-
-
-
-                    icon.src = wasShowing
-
-                        ? "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2F9hAAAABGdBTUEAALGPC%2FxhBQAAAAlwSFlzAAAOwgAADsIBFShKgAAAABl0RVh0U29mdHdhcmUAUGFpbnQuTkVUIHYzLjUuODc7gF0AAAB2SURBVDhPY2AYBThDoKWlJa2jo0OO7CBaunTpfxAGGmRCliEgzc%2BePfs%2Ff%2F78%2F01NTZokGwIyAARAhkybNo10Q2AGwAwBeuV%2Fa2urHtEuWb58OWUuABkAC4Pm5mY7om2GKQQZAMJkaQYZAgx5P4rSAclOHjANAOQrXesb81M5AAAAAElFTkSuQmCC"
-
-                        : "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2F9hAAAABGdBTUEAALGPC%2FxhBQAAAAlwSFlzAAAOwgAADsIBFShKgAAAABl0RVh0U29mdHdhcmUAUGFpbnQuTkVUIHYzLjUuODc7gF0AAABCSURBVDhPY2AYBfQJATU1NWsgLifLNhUVFVeg5v8gTLIBMM2RkZGkG4CsmWQD0DWTbAAowGD%2BRqLJC0SSA24EagAAq9sjtZrUZogAAAAASUVORK5CYII%3D";
-
-                    section.style.display = wasShowing ? "none" : "";
+        except Exception as e:
+            print(f"[ERROR] Exception fetching team admins for {project}: {e}")
+            return [default_email]
