@@ -5,7 +5,6 @@ import csv
 import json
 import os
 import smtplib
-import time
 from email.message import EmailMessage
 from urllib.parse import urljoin
 import aiohttp
@@ -124,10 +123,11 @@ class AzureDevOpsSession:
     async def get_team_admin_emails(self, project, default_email="devsecops@firstcitizens.com"):
         """
         On-prem Azure DevOps Server compatible:
-        Returns list of Team Admin emails or default fallback.
+        Returns list of Team Admin emails including AD group members.
         Uses requests library since on-prem graph API differs from cloud.
         """
         import requests
+        admin_emails = set()
         try:
             url_teams = f"{self.org_url}/{project}/_apis/teams?api-version=7.1-preview.1"
             resp = requests.get(url_teams, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
@@ -136,25 +136,36 @@ class AzureDevOpsSession:
                 return [default_email]
 
             teams = resp.json().get("value", [])
-            admin_emails = []
-
             for team in teams:
                 team_id = team.get("id")
                 members_url = f"{self.org_url}/_apis/projects/{project}/teams/{team_id}/members?api-version=7.1-preview.1"
                 m_resp = requests.get(members_url, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
-                if m_resp.status_code == 200:
-                    members = m_resp.json().get("value", [])
-                    for m in members:
-                        if m.get("isTeamAdmin", False):
+                if m_resp.status_code != 200:
+                    continue
+                members = m_resp.json().get("value", [])
+                for m in members:
+                    if m.get("isTeamAdmin", False):
+                        identity_type = m.get("identityType")  # "user" or "group"
+                        if identity_type == "user":
                             mail = m.get("uniqueName", "")
                             if "@" in mail:
-                                admin_emails.append(mail)
+                                admin_emails.add(mail)
+                        elif identity_type == "group":
+                            # fetch group members
+                            group_id = m.get("id")
+                            members_api = f"{self.org_url}/_apis/identities/{group_id}/members?api-version=7.1-preview.1"
+                            g_resp = requests.get(members_api, headers={"Authorization": f"Basic {self.pat}"}, verify=False)
+                            if g_resp.status_code == 200:
+                                for gm in g_resp.json().get("value", []):
+                                    mail = gm.get("uniqueName")
+                                    if mail and "@" in mail:
+                                        admin_emails.add(mail)
 
             if not admin_emails:
                 print(f"[WARN] No team admins found for {project}, using default email.")
                 return [default_email]
 
-            return list(set(admin_emails))
+            return list(admin_emails)
 
         except Exception as e:
             print(f"[ERROR] Exception fetching team admins for {project}: {e}")
