@@ -9,6 +9,7 @@ from email.message import EmailMessage
 from urllib.parse import urljoin
 
 import aiohttp
+import requests
 import urllib3
 from dotenv import load_dotenv
 from urllib3.exceptions import InsecureRequestWarning
@@ -136,70 +137,89 @@ class AzureDevOpsSession:
             )
             return None
 
+    # --- Updated admin email method using Direct User Cleanup logic ---
     async def get_team_admin_emails(
         self, project, default_email="devsecops@firstcitizens.com"
     ):
-        """
-        On-prem Azure DevOps Server compatible:
-        Returns list of Team Admin emails including AD group members.
-        Uses requests library since on-prem graph API differs from cloud.
-        """
-        import requests
-
+        """Fetch all team admins including nested AD group members."""
         admin_emails = set()
+        base_url = self.org_url
+
         try:
-            url_teams = (
-                f"{self.org_url}/{project}/_apis/teams?api-version=7.1-preview.1"
-            )
+            # Fetch project security groups
+            url_groups = f"{base_url}/{project}/_api/_identity/ReadScopedApplicationGroupsJson?__v=5"
             resp = requests.get(
-                url_teams, headers={"Authorization": f"Basic {self.pat}"}, verify=False
+                url_groups,
+                headers={
+                    "Authorization": f"Basic {base64.b64encode(f':{self.pat}'.encode()).decode()}"
+                },
+                verify=False,
             )
             if resp.status_code != 200:
-                print(f"[WARN] Failed to fetch teams for {project}: {resp.status_code}")
+                print(
+                    f"[WARN] Failed to fetch groups for {project}: {resp.status_code}"
+                )
                 return [default_email]
 
-            teams = resp.json().get("value", [])
-            for team in teams:
-                team_id = team.get("id")
-                members_url = f"{self.org_url}/_apis/projects/{project}/teams/{team_id}/members?api-version=7.1-preview.1"
-                m_resp = requests.get(
-                    members_url,
-                    headers={"Authorization": f"Basic {self.pat}"},
-                    verify=False,
-                )
-                if m_resp.status_code != 200:
-                    continue
-                members = m_resp.json().get("value", [])
-                for m in members:
-                    if m.get("isTeamAdmin", False):
-                        identity_type = m.get("identityType")  # "user" or "group"
-                        if identity_type == "user":
-                            mail = m.get("uniqueName", "")
-                            if "@" in mail:
-                                admin_emails.add(mail)
-                        elif identity_type == "group":
-                            # fetch group members
-                            group_id = m.get("id")
-                            members_api = f"{self.org_url}/_apis/identities/{group_id}/members?api-version=7.1-preview.1"
-                            g_resp = requests.get(
-                                members_api,
-                                headers={"Authorization": f"Basic {self.pat}"},
-                                verify=False,
-                            )
-                            if g_resp.status_code == 200:
-                                for gm in g_resp.json().get("value", []):
-                                    mail = gm.get("uniqueName")
-                                    if mail and "@" in mail:
-                                        admin_emails.add(mail)
+            groups = resp.json().get("identities", [])
+            priority_names = ["Team Admins", "Project Administrator"]
+
+            # Resolve first matching priority group
+            for priority_name in priority_names:
+                for group in groups:
+                    if (
+                        group.get("FriendlyDisplayName", "").lower()
+                        == priority_name.lower()
+                    ):
+                        group_id = group.get("TeamFoundationId")
+                        members_url = f"{base_url}/_api/_identity/ReadGroupMembers?__v=5&scope={group_id}&readMembers=true"
+                        m_resp = requests.get(
+                            members_url,
+                            headers={
+                                "Authorization": f"Basic {base64.b64encode(f':{self.pat}'.encode()).decode()}"
+                            },
+                            verify=False,
+                        )
+                        if m_resp.status_code != 200:
+                            continue
+                        members = m_resp.json().get("identities", [])
+                        for member in members:
+                            identity_type = member.get("IdentityType")
+                            if identity_type.lower() == "user":
+                                mail = member.get("MailAddress")
+                                if mail:
+                                    admin_emails.add(mail)
+                            elif identity_type.lower() == "group":
+                                # Nested AD group
+                                group_entity_id = member["EntityId"]
+                                try:
+                                    ad_members_url = (
+                                        f"{base_url}/_apis/IdentityPicker/Identities/{group_entity_id}/connections?"
+                                        "identityTypes%5B%5D=user&identityTypes%5B%5D=group&operationScopes%5B%5D=ims"
+                                        "&operationScopes%5B%5D=source&connectionTypes%5B%5D=successors&depth=1"
+                                        "&properties%5B%5D=Mail"
+                                    )
+                                    g_resp = requests.get(
+                                        ad_members_url,
+                                        headers={
+                                            "Authorization": f"Basic {base64.b64encode(f':{self.pat}'.encode()).decode()}"
+                                        },
+                                        verify=False,
+                                    )
+                                    if g_resp.status_code == 200:
+                                        for gm in g_resp.json().get("successors", []):
+                                            if gm.get(
+                                                "entityType"
+                                            ) == "User" and gm.get("mail"):
+                                                admin_emails.add(gm.get("mail"))
+                                except Exception as e:
+                                    print(
+                                        f"[WARN] Failed to resolve AD group {member.get('DisplayName')}: {e}"
+                                    )
 
             if not admin_emails:
-                print(
-                    f"[WARN] No team admins found for {project}, using default email."
-                )
                 return [default_email]
-
             return list(admin_emails)
-
         except Exception as e:
             print(f"[ERROR] Exception fetching team admins for {project}: {e}")
             return [default_email]
@@ -342,6 +362,7 @@ async def main(
             print("[INFO] No updates found — skipping CSV generation.")
             return
 
+        # --- Fetch all team admin emails using updated method ---
         all_admin_emails = []
         for project in projects:
             emails = await azdo.get_team_admin_emails(project)
